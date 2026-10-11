@@ -1,8 +1,8 @@
 //! Minimal binding to VirtualBox's C API, loaded at runtime (dlopen) from an installed VirtualBox.
 //!
 //! It covers only what libmicrovmi's MachineDebugger access method needs: attach a shared
-//! session to a running VM by name, read guest physical memory through `IMachineDebugger` and
-//! list the guest's RAM ranges.
+//! session to a running VM by name, read guest physical memory through `IMachineDebugger`, list
+//! the guest's RAM ranges, pause and resume it, and get its vCPU count.
 //!
 //! The function table and vtable indices are hand-written from `VBoxCAPI_v7_3.h`
 //! (`sdk/bindings/c/include` of a VirtualBox build); `VBoxCAPIGlue.c` is the loader reference.
@@ -34,6 +34,8 @@ const READ_CHUNK: usize = 1 << 20;
 const LOCK_TYPE_SHARED: u32 = 1;
 /// `MachineState_FirstOnline..=MachineState_LastOnline`: states with a VM process to talk to.
 const MACHINE_STATES_ONLINE: std::ops::RangeInclusive<u32> = 6..=19;
+const MACHINE_STATE_RUNNING: u32 = 6;
+const MACHINE_STATE_PAUSED: u32 = 7;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -321,6 +323,7 @@ pub struct Vm {
     console: Com,
     session: Com,
     client: &'static Client,
+    cpu_count: u32,
 }
 
 impl Vm {
@@ -358,6 +361,12 @@ impl Vm {
                 state,
             });
         }
+        // Fixed while the VM runs: CPU hot-plug changes the plugged CPUs, not CPUCount.
+        let mut cpu_count = 0;
+        unsafe {
+            let get: unsafe extern "C" fn(*mut Obj, *mut u32) -> HResult = machine.method(21);
+            client.check("IMachine::GetCPUCount", get(machine.0, &mut cpu_count))?;
+        }
         unsafe {
             let lock: unsafe extern "C" fn(*mut Obj, *mut Obj, u32) -> HResult =
                 machine.method(131);
@@ -374,10 +383,61 @@ impl Vm {
             console: Com(ptr::null_mut()),
             session,
             client,
+            cpu_count,
         };
         vm.console = client.get(&vm.session, 8, "ISession::GetConsole")?;
         vm.debugger = client.get(&vm.console, 9, "IConsole::GetDebugger")?;
         Ok(vm)
+    }
+
+    /// The VM's vCPU count (`IMachine::CPUCount`).
+    pub fn cpu_count(&self) -> u32 {
+        self.cpu_count
+    }
+
+    /// Pauses the VM (`IConsole::pause`); a no-op if it is already paused.
+    ///
+    /// Synchronous: on return every vCPU has stopped executing guest code and the VM is in the
+    /// `Paused` state, as other API clients (e.g. `VBoxManage showvminfo`) see it.
+    /// Not counted: a single [`Vm::resume`] resumes the VM however many times it was paused.
+    pub fn pause(&self) -> Result<(), Error> {
+        self.pause_or_resume(30, "IConsole::Pause", MACHINE_STATE_PAUSED)
+    }
+
+    /// Resumes the VM (`IConsole::resume`); a no-op if it is already running.
+    pub fn resume(&self) -> Result<(), Error> {
+        self.pause_or_resume(31, "IConsole::Resume", MACHINE_STATE_RUNNING)
+    }
+
+    /// Calls the no-argument `IConsole` method `idx`, which fails if the VM is already in `target`
+    /// state. That state is checked after a failure rather than before the call, so a concurrent
+    /// pause or resume by another client can't make it fail.
+    fn pause_or_resume(&self, idx: usize, call: &'static str, target: u32) -> Result<(), Error> {
+        let rc = unsafe {
+            let f: unsafe extern "C" fn(*mut Obj) -> HResult = self.console.method(idx);
+            f(self.console.0)
+        };
+        if !failed(rc) {
+            return Ok(());
+        }
+        // taken before the state query, which may overwrite the thread's error info
+        let err = Error::Api {
+            call,
+            rc,
+            text: self.client.take_error_text(),
+        };
+        let mut state = 0;
+        unsafe {
+            let get_state: unsafe extern "C" fn(*mut Obj, *mut u32) -> HResult =
+                self.console.method(4);
+            self.client
+                .check("IConsole::GetState", get_state(self.console.0, &mut state))?;
+        }
+        if state == target {
+            Ok(())
+        } else {
+            Err(err)
+        }
     }
 
     /// Fills `buf` with guest physical memory starting at `paddr` (`IMachineDebugger::readPhysicalMemory`).
