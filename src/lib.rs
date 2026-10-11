@@ -1,7 +1,8 @@
 //! Minimal binding to VirtualBox's C API, loaded at runtime (dlopen) from an installed VirtualBox.
 //!
 //! It covers only what libmicrovmi's MachineDebugger access method needs: attach a shared
-//! session to a running VM by name and read guest physical memory through `IMachineDebugger`.
+//! session to a running VM by name, read guest physical memory through `IMachineDebugger` and
+//! list the guest's RAM ranges.
 //!
 //! The function table and vtable indices are hand-written from `VBoxCAPI_v7_3.h`
 //! (`sdk/bindings/c/include` of a VirtualBox build); `VBoxCAPIGlue.c` is the loader reference.
@@ -9,6 +10,7 @@
 use std::cell::Cell;
 use std::convert::TryFrom;
 use std::ffi::c_void;
+use std::ops::Range;
 use std::os::raw::c_char;
 use std::path::Path;
 use std::ptr;
@@ -235,14 +237,22 @@ impl Client {
             let get_text: unsafe extern "C" fn(*mut Obj, *mut *mut u16) -> HResult =
                 info.method(17); // IVirtualBoxErrorInfo::GetText
             let mut text = ptr::null_mut();
-            if failed(get_text(info.0, &mut text)) || text.is_null() {
+            if failed(get_text(info.0, &mut text)) {
                 return None;
             }
-            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
-            (self.api.com_unalloc_string)(text.cast());
-            Some(s)
+            self.take_string(text)
         }
+    }
+
+    /// Converts and frees a string returned by the API; `None` if null.
+    unsafe fn take_string(&self, s: *mut u16) -> Option<String> {
+        if s.is_null() {
+            return None;
+        }
+        let len = (0..).take_while(|&i| *s.add(i) != 0).count();
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(s, len));
+        (self.api.com_unalloc_string)(s.cast());
+        Some(out)
     }
 
     /// Calls an interface-returning getter at vtable index `idx` of `obj`.
@@ -412,6 +422,66 @@ impl Vm {
         }
         Ok(())
     }
+
+    /// The guest-physical RAM ranges (pages of type RAM, so excluding MMIO, MMIO2 and ROM),
+    /// sorted by address and merged when contiguous, parsed from the PGM `phys` info handler.
+    pub fn ram_ranges(&self) -> Result<Vec<Range<u64>>, Error> {
+        const CALL: &str = "IMachineDebugger::Info";
+        let utf16 = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let (name, args) = (utf16("phys"), utf16("verbose"));
+        let mut out = ptr::null_mut();
+        let text = unsafe {
+            let info: unsafe extern "C" fn(
+                *mut Obj,
+                *const u16,
+                *const u16,
+                *mut *mut u16,
+            ) -> HResult = self.debugger.method(43);
+            self.client.check(
+                CALL,
+                info(self.debugger.0, name.as_ptr(), args.as_ptr(), &mut out),
+            )?;
+            self.client.take_string(out)
+        };
+        let ranges = text.as_deref().map(parse_ram_ranges).unwrap_or_default();
+        if ranges.is_empty() {
+            return Err(Error::Api {
+                call: CALL,
+                rc: E_UNEXPECTED,
+                text: Some(format!("no RAM range in \"phys\" info: {:?}", text)),
+            });
+        }
+        Ok(ranges)
+    }
+}
+
+/// Parses the page-type lines of `pgmR3PhysInfo` (`info phys verbose`): per RAM range, an
+/// indented `{first:016x}-{last:016x} {type}[ {desc}]` line per run of same-type pages, with
+/// type `RAM`, `MMIO`, `MMIO2`, `ROM`, `ROM-shadowed`, ... Keeps `RAM` runs only, merged.
+fn parse_ram_ranges(text: &str) -> Vec<Range<u64>> {
+    let mut ranges: Vec<Range<u64>> = text
+        .lines()
+        .filter(|l| l.starts_with(' '))
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            let (first, last) = words.next()?.split_once('-')?;
+            if words.next()? != "RAM" {
+                return None;
+            }
+            let first = u64::from_str_radix(first, 16).ok()?;
+            let end = u64::from_str_radix(last, 16).ok()?.checked_add(1)?;
+            Some(first..end)
+        })
+        .collect();
+    ranges.sort_by_key(|r| r.start);
+    ranges.dedup_by(|next, prev| {
+        let contiguous = next.start <= prev.end;
+        if contiguous {
+            prev.end = prev.end.max(next.end);
+        }
+        contiguous
+    });
+    ranges
 }
 
 impl Drop for Vm {
@@ -436,5 +506,20 @@ mod tests {
         assert!(!version_compatible(0x0003_0001));
         assert_eq!(version_string(Some(0x0005_0000)), "5.0");
         assert_eq!(version_string(None), "unknown");
+    }
+
+    #[test]
+    fn ram_ranges_parse() {
+        // `VBoxManage debugvm <vm> info phys verbose` of a 5 GiB guest.
+        let text = include_str!("../testdata/phys-5g.txt");
+        assert_eq!(
+            parse_ram_ranges(text),
+            vec![
+                0..0xa0000,
+                0x100000..0xe000_0000,
+                0x1_0000_0000..0x1_6000_0000
+            ]
+        );
+        assert!(parse_ram_ranges("RAM ranges (pVM=0)\n").is_empty());
     }
 }
