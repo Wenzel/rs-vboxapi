@@ -425,6 +425,7 @@ impl Vm {
 
     /// The guest-physical RAM ranges (pages of type RAM, so excluding MMIO, MMIO2 and ROM),
     /// sorted by address and merged when contiguous, parsed from the PGM `phys` info handler.
+    /// Never empty: no RAM range, or a page-type line that does not parse, is an error.
     pub fn ram_ranges(&self) -> Result<Vec<Range<u64>>, Error> {
         const CALL: &str = "IMachineDebugger::Info";
         let utf16 = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
@@ -443,36 +444,44 @@ impl Vm {
             )?;
             self.client.take_string(out)
         };
-        let ranges = text.as_deref().map(parse_ram_ranges).unwrap_or_default();
-        if ranges.is_empty() {
-            return Err(Error::Api {
-                call: CALL,
-                rc: E_UNEXPECTED,
-                text: Some(format!("no RAM range in \"phys\" info: {:?}", text)),
-            });
-        }
-        Ok(ranges)
+        parse_ram_ranges(text.as_deref().unwrap_or_default()).map_err(|e| Error::Api {
+            call: CALL,
+            rc: E_UNEXPECTED,
+            text: Some(format!("\"phys\" info: {}", e)),
+        })
     }
 }
 
 /// Parses the page-type lines of `pgmR3PhysInfo` (`info phys verbose`): per RAM range, an
 /// indented `{first:016x}-{last:016x} {type}[ {desc}]` line per run of same-type pages, with
 /// type `RAM`, `MMIO`, `MMIO2`, `ROM`, `ROM-shadowed`, ... Keeps `RAM` runs only, merged.
-fn parse_ram_ranges(text: &str) -> Vec<Range<u64>> {
-    let mut ranges: Vec<Range<u64>> = text
-        .lines()
-        .filter(|l| l.starts_with(' '))
-        .filter_map(|l| {
-            let mut words = l.split_whitespace();
+/// Every indented line must parse, so a format change can't silently lower the max address.
+fn parse_ram_ranges(text: &str) -> Result<Vec<Range<u64>>, String> {
+    let mut ranges = Vec::new();
+    for line in text.lines().filter(|l| l.starts_with(' ')) {
+        let parsed = || -> Option<(u64, u64, bool)> {
+            let mut words = line.split_whitespace();
             let (first, last) = words.next()?.split_once('-')?;
-            if words.next()? != "RAM" {
-                return None;
-            }
-            let first = u64::from_str_radix(first, 16).ok()?;
-            let end = u64::from_str_radix(last, 16).ok()?.checked_add(1)?;
-            Some(first..end)
-        })
-        .collect();
+            let is_ram = words.next()? == "RAM";
+            Some((
+                u64::from_str_radix(first, 16).ok()?,
+                u64::from_str_radix(last, 16).ok()?,
+                is_ram,
+            ))
+        };
+        let (first, last, is_ram) =
+            parsed().ok_or_else(|| format!("unexpected line {:?}", line))?;
+        if is_ram {
+            // An end-exclusive Range can't hold a range ending at u64::MAX.
+            let end = last.checked_add(1).ok_or_else(|| {
+                format!("RAM range ends at the top of the address space: {:?}", line)
+            })?;
+            ranges.push(first..end);
+        }
+    }
+    if ranges.is_empty() {
+        return Err(format!("no RAM range in {} lines", text.lines().count()));
+    }
     ranges.sort_by_key(|r| r.start);
     ranges.dedup_by(|next, prev| {
         let contiguous = next.start <= prev.end;
@@ -481,7 +490,7 @@ fn parse_ram_ranges(text: &str) -> Vec<Range<u64>> {
         }
         contiguous
     });
-    ranges
+    Ok(ranges)
 }
 
 impl Drop for Vm {
@@ -513,13 +522,39 @@ mod tests {
         // `VBoxManage debugvm <vm> info phys verbose` of a 5 GiB guest.
         let text = include_str!("../testdata/phys-5g.txt");
         assert_eq!(
-            parse_ram_ranges(text),
+            parse_ram_ranges(text).unwrap(),
             vec![
                 0..0xa0000,
                 0x100000..0xe000_0000,
                 0x1_0000_0000..0x1_6000_0000
             ]
         );
-        assert!(parse_ram_ranges("RAM ranges (pVM=0)\n").is_empty());
+        assert_eq!(
+            parse_ram_ranges("RAM ranges (pVM=0)\nGC Phys Range\n").unwrap_err(),
+            "no RAM range in 2 lines"
+        );
+        // A page-type line that doesn't parse, RAM or not, is an error, not a skipped range.
+        for bad in [
+            "    0000000100000000-15fffffff_ RAM",
+            "    0000000100000000 RAM",
+            "    0000000100000000-000000015fffffff",
+            "    garbage",
+        ] {
+            let text = format!("{}\n    0000000000000000-000000000009ffff RAM\n", bad);
+            assert!(parse_ram_ranges(&text)
+                .unwrap_err()
+                .starts_with("unexpected line"));
+        }
+        assert!(
+            parse_ram_ranges("    0000000100000000-ffffffffffffffff RAM\n")
+                .unwrap_err()
+                .starts_with("RAM range ends at the top")
+        );
+        // Non-RAM lines may end at u64::MAX.
+        assert_eq!(
+            parse_ram_ranges("    0-fff RAM\n    ffffffff00000000-ffffffffffffffff MMIO\n")
+                .unwrap(),
+            vec![0..0x1000]
+        );
     }
 }
