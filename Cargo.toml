@@ -1,0 +1,11 @@
+[package]
+name = "vboxapi"
+version = "0.1.0"
+edition = "2018"
+description = "Minimal runtime-loaded binding to VirtualBox's C API, for libmicrovmi's MachineDebugger access method"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+libloading = "0.8"
+thiserror = "1.0"
