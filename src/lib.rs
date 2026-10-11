@@ -59,7 +59,7 @@ pub enum Error {
     VmBusy(u32),
     #[error("VM is in MachineState {state}, expected {expected}")]
     UnexpectedState { state: u32, expected: u32 },
-    #[error("this VirtualBox does not implement IMachineDebugger::readPhysicalMemory: it lacks the IMachineDebugger memory access patch (build Wenzel/virtualbox branch vmi/machinedebugger, or use a VirtualBox release that includes it)")]
+    #[error("this VirtualBox does not implement IMachineDebugger physical memory access: it lacks the IMachineDebugger memory access patch (build Wenzel/virtualbox branch vmi/machinedebugger, or use a VirtualBox release that includes it)")]
     MemoryAccessNotImplemented,
     #[error("guest physical range {paddr:#x} + {len:#x} is out of range")]
     AddressOutOfRange { paddr: u64, len: usize },
