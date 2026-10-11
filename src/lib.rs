@@ -36,6 +36,11 @@ const LOCK_TYPE_SHARED: u32 = 1;
 const MACHINE_STATES_ONLINE: std::ops::RangeInclusive<u32> = 6..=19;
 const MACHINE_STATE_RUNNING: u32 = 6;
 const MACHINE_STATE_PAUSED: u32 = 7;
+/// Teleporting, LiveSnapshotting, TeleportingPausedVM, OnlineSnapshotting: pause and resume are
+/// VirtualBox's own until the operation ends.
+const MACHINE_STATES_BUSY: [u32; 4] = [9, 10, 15, 19];
+/// Pause or resume attempts when another client keeps flipping the state.
+const PAUSE_RESUME_ATTEMPTS: usize = 3;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -47,6 +52,10 @@ pub enum Error {
     VmNotFound(String),
     #[error("VM {name:?} is not running (MachineState {state})")]
     VmNotRunning { name: String, state: u32 },
+    #[error("VM is busy: live snapshot or teleport in progress (MachineState {0})")]
+    VmBusy(u32),
+    #[error("VM is in MachineState {state}, expected {expected}")]
+    UnexpectedState { state: u32, expected: u32 },
     #[error("guest physical range {paddr:#x} + {len:#x} is out of range")]
     AddressOutOfRange { paddr: u64, len: usize },
     #[error("VirtualBox API call {call} failed with {rc:#010x}{}", text.as_ref().map(|t| format!(": {}", t)).unwrap_or_default())]
@@ -266,6 +275,16 @@ impl Client {
         }
         owned(call, out)
     }
+
+    /// Calls a `u32` getter at vtable index `idx` of `obj`.
+    fn get_u32(&self, obj: &Com, idx: usize, call: &'static str) -> Result<u32, Error> {
+        let mut out = 0;
+        unsafe {
+            let getter: unsafe extern "C" fn(*mut Obj, *mut u32) -> HResult = obj.method(idx);
+            self.check(call, getter(obj.0, &mut out))?;
+        }
+        Ok(out)
+    }
 }
 
 /// Loads the library from `VBOX_APP_HOME`, else from the first standard directory that has it.
@@ -350,23 +369,15 @@ impl Vm {
         client.check("IVirtualBox::FindMachine", rc)?;
         let machine = owned("IVirtualBox::FindMachine", machine)?;
 
-        let mut state = 0;
-        unsafe {
-            let get_state: unsafe extern "C" fn(*mut Obj, *mut u32) -> HResult = machine.method(61);
-            client.check("IMachine::GetState", get_state(machine.0, &mut state))?;
-        }
+        let state = client.get_u32(&machine, 61, "IMachine::GetState")?;
         if !MACHINE_STATES_ONLINE.contains(&state) {
             return Err(Error::VmNotRunning {
                 name: name.to_string(),
                 state,
             });
         }
-        // Fixed while the VM runs: CPU hot-plug changes the plugged CPUs, not CPUCount.
-        let mut cpu_count = 0;
-        unsafe {
-            let get: unsafe extern "C" fn(*mut Obj, *mut u32) -> HResult = machine.method(21);
-            client.check("IMachine::GetCPUCount", get(machine.0, &mut cpu_count))?;
-        }
+        // shortcut: CPUCount is the maximum with CPU hot-plug, not the plugged vCPUs; count those if hot-plug matters.
+        let cpu_count = client.get_u32(&machine, 21, "IMachine::GetCPUCount")?;
         unsafe {
             let lock: unsafe extern "C" fn(*mut Obj, *mut Obj, u32) -> HResult =
                 machine.method(131);
@@ -390,54 +401,81 @@ impl Vm {
         Ok(vm)
     }
 
-    /// The VM's vCPU count (`IMachine::CPUCount`).
+    /// The VM's vCPU count (`IMachine::CPUCount`), read at attach.
+    ///
+    /// With CPU hot-plug enabled, this is the maximum vCPU count, not the vCPUs plugged in.
     pub fn cpu_count(&self) -> u32 {
         self.cpu_count
     }
 
     /// Pauses the VM (`IConsole::pause`); a no-op if it is already paused.
     ///
-    /// Synchronous: on return every vCPU has stopped executing guest code and the VM is in the
+    /// Synchronous: on success every vCPU has stopped executing guest code and the VM is in the
     /// `Paused` state, as other API clients (e.g. `VBoxManage showvminfo`) see it.
-    /// Not counted: a single [`Vm::resume`] resumes the VM however many times it was paused.
+    /// Not counted: a single [`Vm::resume`] resumes the VM however many times it was paused, by
+    /// anyone. During a live snapshot or teleport it fails with [`Error::VmBusy`].
     pub fn pause(&self) -> Result<(), Error> {
-        self.pause_or_resume(30, "IConsole::Pause", MACHINE_STATE_PAUSED)
+        self.pause_or_resume(
+            30,
+            "IConsole::Pause",
+            MACHINE_STATE_PAUSED,
+            MACHINE_STATE_RUNNING,
+        )
     }
 
     /// Resumes the VM (`IConsole::resume`); a no-op if it is already running.
+    /// During a live snapshot or teleport it fails with [`Error::VmBusy`].
     pub fn resume(&self) -> Result<(), Error> {
-        self.pause_or_resume(31, "IConsole::Resume", MACHINE_STATE_RUNNING)
+        self.pause_or_resume(
+            31,
+            "IConsole::Resume",
+            MACHINE_STATE_RUNNING,
+            MACHINE_STATE_PAUSED,
+        )
     }
 
     /// Calls the no-argument `IConsole` method `idx`, which fails if the VM is already in `target`
-    /// state. That state is checked after a failure rather than before the call, so a concurrent
-    /// pause or resume by another client can't make it fail.
-    fn pause_or_resume(&self, idx: usize, call: &'static str, target: u32) -> Result<(), Error> {
-        let rc = unsafe {
-            let f: unsafe extern "C" fn(*mut Obj) -> HResult = self.console.method(idx);
-            f(self.console.0)
-        };
-        if !failed(rc) {
-            return Ok(());
+    /// state, then checks the state. Succeeds only in `target` state; retried while another
+    /// client moves the VM back to `from` in between.
+    fn pause_or_resume(
+        &self,
+        idx: usize,
+        call: &'static str,
+        target: u32,
+        from: u32,
+    ) -> Result<(), Error> {
+        let mut last = None;
+        for _ in 0..PAUSE_RESUME_ATTEMPTS {
+            let rc = unsafe {
+                let f: unsafe extern "C" fn(*mut Obj) -> HResult = self.console.method(idx);
+                f(self.console.0)
+            };
+            // taken before the state query, which may overwrite the thread's error info
+            let err = failed(rc).then(|| Error::Api {
+                call,
+                rc,
+                text: self.client.take_error_text(),
+            });
+            let state = match self.client.get_u32(&self.console, 4, "IConsole::GetState") {
+                Ok(state) => state,
+                Err(e) => return Err(err.unwrap_or(e)),
+            };
+            if state == target {
+                return Ok(());
+            }
+            if MACHINE_STATES_BUSY.contains(&state) {
+                return Err(Error::VmBusy(state));
+            }
+            let err = err.unwrap_or(Error::UnexpectedState {
+                state,
+                expected: target,
+            });
+            if state != from {
+                return Err(err);
+            }
+            last = Some(err);
         }
-        // taken before the state query, which may overwrite the thread's error info
-        let err = Error::Api {
-            call,
-            rc,
-            text: self.client.take_error_text(),
-        };
-        let mut state = 0;
-        unsafe {
-            let get_state: unsafe extern "C" fn(*mut Obj, *mut u32) -> HResult =
-                self.console.method(4);
-            self.client
-                .check("IConsole::GetState", get_state(self.console.0, &mut state))?;
-        }
-        if state == target {
-            Ok(())
-        } else {
-            Err(err)
-        }
+        Err(last.expect("at least one attempt"))
     }
 
     /// Fills `buf` with guest physical memory starting at `paddr` (`IMachineDebugger::readPhysicalMemory`).
