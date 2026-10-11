@@ -1,8 +1,9 @@
 //! Minimal binding to VirtualBox's C API, loaded at runtime (dlopen) from an installed VirtualBox.
 //!
 //! It covers only what libmicrovmi's MachineDebugger access method needs: attach a shared
-//! session to a running VM by name, read and write guest physical memory through `IMachineDebugger`, list
-//! the guest's RAM ranges, pause and resume it, and get its vCPU count.
+//! session to a running VM by name, read and write guest physical memory and CPU registers
+//! through `IMachineDebugger`, list the guest's RAM ranges, pause and resume it, and get its
+//! vCPU count.
 //!
 //! The function table and vtable indices are hand-written from `VBoxCAPI_v7_3.h`
 //! (`sdk/bindings/c/include` of a VirtualBox build); `VBoxCAPIGlue.c` is the loader reference.
@@ -61,6 +62,8 @@ pub enum Error {
     UnexpectedState { state: u32, expected: u32 },
     #[error("this VirtualBox does not implement IMachineDebugger physical memory access: it lacks the IMachineDebugger memory access patch (build Wenzel/virtualbox branch vmi/machinedebugger, or use a VirtualBox release that includes it)")]
     MemoryAccessNotImplemented,
+    #[error("this VirtualBox does not implement IMachineDebugger register access: it lacks the IMachineDebugger register patch (build Wenzel/virtualbox branch vmi/machinedebugger, or use a VirtualBox release that includes it)")]
+    RegisterAccessNotImplemented,
     #[error("guest physical range {paddr:#x} + {len:#x} is out of range")]
     AddressOutOfRange { paddr: u64, len: usize },
     #[error("VirtualBox API call {call} failed with {rc:#010x}{}", text.as_ref().map(|t| format!(": {}", t)).unwrap_or_default())]
@@ -92,10 +95,12 @@ struct CApi {
     _client_thread_uninitialize: usize,
     _client_uninitialize: usize,
     _com_init_uninit: [usize; 2],
-    /// Frees strings and raw XPCOM out-arrays (`pfnComUnallocMem` is an alias of it).
+    /// Frees strings returned by XPCOM.
     com_unalloc_string: unsafe extern "C" fn(*mut c_void),
     _utf: [usize; 4],
-    _safe_array: [usize; 7],
+    _safe_array: [usize; 6],
+    /// Frees the outer allocation of a raw XPCOM out-array.
+    array_out_free: unsafe extern "C" fn(*mut c_void) -> HResult,
     _get_event_queue: usize,
     get_exception: unsafe extern "C" fn(*mut *mut Obj) -> HResult,
     clear_exception: unsafe extern "C" fn() -> HResult,
@@ -271,6 +276,60 @@ impl Client {
         Some(out)
     }
 
+    /// Frees an array of strings returned by a failed XPCOM call.
+    unsafe fn free_string_array(&self, len: u32, strings: *mut *mut u16) {
+        if !strings.is_null() {
+            for &string in std::slice::from_raw_parts(strings, len as usize) {
+                (self.api.com_unalloc_string)(string.cast());
+            }
+            (self.api.array_out_free)(strings.cast());
+        }
+    }
+
+    /// Converts and frees an array of strings returned by XPCOM.
+    unsafe fn take_string_array(
+        &self,
+        call: &'static str,
+        len: u32,
+        strings: *mut *mut u16,
+    ) -> Result<Vec<String>, Error> {
+        if strings.is_null() {
+            return if len == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(Error::Api {
+                    call,
+                    rc: E_UNEXPECTED,
+                    text: Some(format!("returned a null array with {} elements", len)),
+                })
+            };
+        }
+        let mut out = Vec::with_capacity(len as usize);
+        let mut null_element = None;
+        for (i, &string) in std::slice::from_raw_parts(strings, len as usize)
+            .iter()
+            .enumerate()
+        {
+            match self.take_string(string) {
+                Some(string) => out.push(string),
+                None => {
+                    null_element.get_or_insert(i);
+                    out.push(String::new());
+                }
+            }
+        }
+        (self.api.array_out_free)(strings.cast());
+        if let Some(i) = null_element {
+            Err(Error::Api {
+                call,
+                rc: E_UNEXPECTED,
+                text: Some(format!("returned a null string at index {}", i)),
+            })
+        } else {
+            Ok(out)
+        }
+    }
+
     /// Calls an interface-returning getter at vtable index `idx` of `obj`.
     fn get(&self, obj: &Com, idx: usize, call: &'static str) -> Result<Com, Error> {
         let mut out = ptr::null_mut();
@@ -420,6 +479,151 @@ impl Vm {
     /// With CPU hot-plug enabled, this is the maximum vCPU count, not the vCPUs plugged in.
     pub fn cpu_count(&self) -> u32 {
         self.cpu_count
+    }
+
+    /// Reads one CPU register through `IMachineDebugger::getRegister`.
+    pub fn register(&self, cpu_id: u32, name: &str) -> Result<String, Error> {
+        const CALL: &str = "IMachineDebugger::GetRegister";
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let mut value = ptr::null_mut();
+        let rc = unsafe {
+            let get: unsafe extern "C" fn(*mut Obj, u32, *const u16, *mut *mut u16) -> HResult =
+                self.debugger.method(56);
+            get(self.debugger.0, cpu_id, name.as_ptr(), &mut value)
+        };
+        if rc == E_NOTIMPL {
+            self.client.take_error_text();
+            return Err(Error::RegisterAccessNotImplemented);
+        }
+        self.client.check(CALL, rc)?;
+        unsafe { self.client.take_string(value) }.ok_or(Error::Api {
+            call: CALL,
+            rc: E_UNEXPECTED,
+            text: Some("returned a null string".to_string()),
+        })
+    }
+
+    /// Reads all register sets through `IMachineDebugger::getRegisters`.
+    ///
+    /// VirtualBox currently ignores `cpu_id` and returns every CPU set (`cpu0.*`, `cpu1.*`,
+    /// ...) followed by device register sets.
+    pub fn registers(&self, cpu_id: u32) -> Result<Vec<(String, String)>, Error> {
+        const CALL: &str = "IMachineDebugger::GetRegisters";
+        let (mut names_len, mut values_len) = (0, 0);
+        let (mut names, mut values) = (ptr::null_mut(), ptr::null_mut());
+        let rc = unsafe {
+            let get: unsafe extern "C" fn(
+                *mut Obj,
+                u32,
+                *mut u32,
+                *mut *mut *mut u16,
+                *mut u32,
+                *mut *mut *mut u16,
+            ) -> HResult = self.debugger.method(57);
+            get(
+                self.debugger.0,
+                cpu_id,
+                &mut names_len,
+                &mut names,
+                &mut values_len,
+                &mut values,
+            )
+        };
+        if failed(rc) {
+            let error = if rc == E_NOTIMPL {
+                self.client.take_error_text();
+                Error::RegisterAccessNotImplemented
+            } else {
+                self.client.check(CALL, rc).unwrap_err()
+            };
+            unsafe {
+                self.client.free_string_array(names_len, names);
+                self.client.free_string_array(values_len, values);
+            }
+            return Err(error);
+        }
+        let names = unsafe { self.client.take_string_array(CALL, names_len, names) };
+        let values = unsafe { self.client.take_string_array(CALL, values_len, values) };
+        let names = names?;
+        let values = values?;
+        if names.len() != values.len() {
+            return Err(Error::Api {
+                call: CALL,
+                rc: E_UNEXPECTED,
+                text: Some(format!(
+                    "returned {} names but {} values",
+                    names.len(),
+                    values.len()
+                )),
+            });
+        }
+        Ok(names.into_iter().zip(values).collect())
+    }
+
+    /// Writes one CPU register through `IMachineDebugger::setRegister`.
+    pub fn set_register(&self, cpu_id: u32, name: &str, value: &str) -> Result<(), Error> {
+        const CALL: &str = "IMachineDebugger::SetRegister";
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let value: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+        let rc = unsafe {
+            let set: unsafe extern "C" fn(*mut Obj, u32, *const u16, *const u16) -> HResult =
+                self.debugger.method(58);
+            set(self.debugger.0, cpu_id, name.as_ptr(), value.as_ptr())
+        };
+        if rc == E_NOTIMPL {
+            self.client.take_error_text();
+            return Err(Error::RegisterAccessNotImplemented);
+        }
+        self.client.check(CALL, rc)
+    }
+
+    /// Writes CPU registers through one `IMachineDebugger::setRegisters` call.
+    ///
+    /// VirtualBox applies entries in order and stops at the first error; entries before it stay
+    /// written. Pause the VM first when the register set must be updated consistently.
+    pub fn set_registers(&self, cpu_id: u32, registers: &[(&str, &str)]) -> Result<(), Error> {
+        const CALL: &str = "IMachineDebugger::SetRegisters";
+        if registers.is_empty() {
+            return Ok(());
+        }
+        let len = u32::try_from(registers.len()).map_err(|_| Error::Api {
+            call: CALL,
+            rc: E_UNEXPECTED,
+            text: Some(format!("too many registers: {}", registers.len())),
+        })?;
+        let names: Vec<Vec<u16>> = registers
+            .iter()
+            .map(|(name, _)| name.encode_utf16().chain(Some(0)).collect())
+            .collect();
+        let values: Vec<Vec<u16>> = registers
+            .iter()
+            .map(|(_, value)| value.encode_utf16().chain(Some(0)).collect())
+            .collect();
+        let name_ptrs: Vec<*const u16> = names.iter().map(|name| name.as_ptr()).collect();
+        let value_ptrs: Vec<*const u16> = values.iter().map(|value| value.as_ptr()).collect();
+        let rc = unsafe {
+            let set: unsafe extern "C" fn(
+                *mut Obj,
+                u32,
+                u32,
+                *const *const u16,
+                u32,
+                *const *const u16,
+            ) -> HResult = self.debugger.method(59);
+            set(
+                self.debugger.0,
+                cpu_id,
+                len,
+                name_ptrs.as_ptr(),
+                len,
+                value_ptrs.as_ptr(),
+            )
+        };
+        if rc == E_NOTIMPL {
+            self.client.take_error_text();
+            return Err(Error::RegisterAccessNotImplemented);
+        }
+        self.client.check(CALL, rc)
     }
 
     /// Pauses the VM (`IConsole::pause`); a no-op if it is already paused.
