@@ -354,6 +354,8 @@ impl Vm {
     /// The first call in the process loads the VirtualBox C API from `VBOX_APP_HOME`, else from
     /// `/opt/VirtualBox` or `/usr/lib/virtualbox` (only for an installed VirtualBox, whose
     /// compiled-in path XPCOM uses), and keeps it loaded until the process exits.
+    ///
+    /// Fails with [`Error::MemoryAccessNotImplemented`] on a VirtualBox without the memory access patch.
     pub fn attach(name: &str) -> Result<Vm, Error> {
         let client = client()?;
         let session = client.get(&client.vbox_client, 4, "IVirtualBoxClient::GetSession")?;
@@ -401,6 +403,13 @@ impl Vm {
         };
         vm.console = client.get(&vm.session, 8, "ISession::GetConsole")?;
         vm.debugger = client.get(&vm.console, 9, "IConsole::GetDebugger")?;
+        // Probe one byte, so a VirtualBox without the memory access patch fails here, not on
+        // the first read. Physical address 0 is RAM on a PC; any other error is left to the reads.
+        match vm.read_physical(0, &mut [0]) {
+            Err(e @ Error::MemoryAccessNotImplemented) => return Err(e),
+            Err(e) => log::debug!("memory access probe failed: {}", e),
+            Ok(()) => {}
+        }
         Ok(vm)
     }
 
