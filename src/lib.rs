@@ -1,7 +1,7 @@
 //! Minimal binding to VirtualBox's C API, loaded at runtime (dlopen) from an installed VirtualBox.
 //!
 //! It covers only what libmicrovmi's MachineDebugger access method needs: attach a shared
-//! session to a running VM by name, read guest physical memory through `IMachineDebugger`, list
+//! session to a running VM by name, read and write guest physical memory through `IMachineDebugger`, list
 //! the guest's RAM ranges, pause and resume it, and get its vCPU count.
 //!
 //! The function table and vtable indices are hand-written from `VBoxCAPI_v7_3.h`
@@ -32,6 +32,8 @@ const E_UNEXPECTED: HResult = 0x8000_FFFF;
 const E_NOTIMPL: HResult = 0x8000_4001;
 /// Bytes per `readPhysicalMemory` call.
 const READ_CHUNK: usize = 1 << 20;
+/// Bytes per `writePhysicalMemory` call.
+const WRITE_CHUNK: usize = 1 << 20;
 const LOCK_TYPE_SHARED: u32 = 1;
 /// `MachineState_FirstOnline..=MachineState_LastOnline`: states with a VM process to talk to.
 const MACHINE_STATES_ONLINE: std::ops::RangeInclusive<u32> = 6..=19;
@@ -533,6 +535,38 @@ impl Vm {
             };
             unsafe { (self.client.api.com_unalloc_string)(data.cast()) };
             result?;
+            addr += chunk.len() as i64;
+        }
+        Ok(())
+    }
+
+    /// Writes `buf` to guest physical memory starting at `paddr` (`IMachineDebugger::writePhysicalMemory`).
+    ///
+    /// Not atomic: on error, a prefix of `buf` may already be written. Pages that are not backed
+    /// by host memory (MMIO, ballooned, unassigned) fail at the first such page, without touching
+    /// any device. Fails with [`Error::MemoryAccessNotImplemented`] on a VirtualBox without the
+    /// memory access patch.
+    pub fn write_physical(&self, paddr: u64, buf: &[u8]) -> Result<(), Error> {
+        let end = i64::try_from(paddr)
+            .ok()
+            .and_then(|start| start.checked_add(i64::try_from(buf.len()).ok()?))
+            .ok_or(Error::AddressOutOfRange {
+                paddr,
+                len: buf.len(),
+            })?;
+        // XPCOM passes a safearray in-parameter as (element count, pointer).
+        let write: unsafe extern "C" fn(*mut Obj, i64, u32, u32, *const u8) -> HResult =
+            unsafe { self.debugger.method(49) };
+        let mut addr = end - buf.len() as i64;
+        for chunk in buf.chunks(WRITE_CHUNK) {
+            let len = chunk.len() as u32;
+            let rc = unsafe { write(self.debugger.0, addr, len, len, chunk.as_ptr()) };
+            if rc == E_NOTIMPL {
+                self.client.take_error_text();
+                return Err(Error::MemoryAccessNotImplemented);
+            }
+            self.client
+                .check("IMachineDebugger::WritePhysicalMemory", rc)?;
             addr += chunk.len() as i64;
         }
         Ok(())
