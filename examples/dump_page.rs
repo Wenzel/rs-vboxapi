@@ -23,6 +23,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut page = vec![0u8; 4096];
     vm.read_physical(paddr, &mut page)?;
     std::fs::write(&args[3], &page)?;
-    println!("dumped {:#x}..{:#x} to {}", paddr, paddr + 4096, args[3]);
+    println!("dumped page {:#x} to {}", paddr, args[3]);
     Ok(())
 }

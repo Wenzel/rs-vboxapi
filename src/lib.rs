@@ -6,10 +6,14 @@
 //! The function table and vtable indices are hand-written from `VBoxCAPI_v7_3.h`
 //! (`sdk/bindings/c/include` of a VirtualBox build); `VBoxCAPIGlue.c` is the loader reference.
 
+use std::cell::Cell;
+use std::convert::TryFrom;
 use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::path::Path;
 use std::ptr;
+use std::sync::Mutex;
+use std::thread::ThreadId;
 
 use libloading::Library;
 
@@ -23,6 +27,8 @@ const SEARCH_DIRS: &[&str] = &["/opt/VirtualBox", "/usr/lib/virtualbox"];
 const CAPI_VERSION: u32 = 0x0004_0001;
 const VBOX_E_OBJECT_NOT_FOUND: HResult = 0x80BB_0001;
 const E_UNEXPECTED: HResult = 0x8000_FFFF;
+/// Bytes per `readPhysicalMemory` call.
+const READ_CHUNK: usize = 1 << 20;
 const LOCK_TYPE_SHARED: u32 = 1;
 /// `MachineState_FirstOnline..=MachineState_LastOnline`: states with a VM process to talk to.
 const MACHINE_STATES_ONLINE: std::ops::RangeInclusive<u32> = 6..=19;
@@ -37,6 +43,8 @@ pub enum Error {
     VmNotFound(String),
     #[error("VM {name:?} is not running (MachineState {state})")]
     VmNotRunning { name: String, state: u32 },
+    #[error("guest physical range {paddr:#x} + {len:#x} is out of range")]
+    AddressOutOfRange { paddr: u64, len: usize },
     #[error("VirtualBox API call {call} failed with {rc:#010x}{}", text.as_ref().map(|t| format!(": {}", t)).unwrap_or_default())]
     Api {
         call: &'static str,
@@ -62,8 +70,9 @@ struct CApi {
     version: u32,
     _get_versions: [usize; 2],
     client_initialize: unsafe extern "C" fn(*const c_char, *mut *mut Obj) -> HResult,
-    _client_thread_init_uninit: [usize; 2],
-    client_uninitialize: unsafe extern "C" fn(),
+    client_thread_initialize: unsafe extern "C" fn() -> HResult,
+    _client_thread_uninitialize: usize,
+    _client_uninitialize: usize,
     _com_init_uninit: [usize; 2],
     /// Frees strings and raw XPCOM out-arrays (`pfnComUnallocMem` is an alias of it).
     com_unalloc_string: unsafe extern "C" fn(*mut c_void),
@@ -101,63 +110,103 @@ impl Drop for Com {
     }
 }
 
-/// The loaded library and its initialized client; uninitialized on drop.
-struct Glue {
-    api: *const CApi,
-    _lib: Library,
+/// The process-wide C API: VirtualBox allows one `IVirtualBoxClient` per process, so every
+/// [`Vm`] shares it. It is never uninitialized and the library is never unloaded (both live
+/// until the process exits), which keeps attach → drop → attach and concurrent `Vm`s safe.
+struct Client {
+    api: &'static CApi,
+    vbox: Com,
+    vbox_client: Com,
+    thread: ThreadId,
 }
 
-impl Glue {
-    fn load() -> Result<Glue, Error> {
-        if let Some(home) = std::env::var_os("VBOX_APP_HOME") {
-            return Glue::load_from(Path::new(&home));
-        }
-        let mut errors = Vec::new();
-        for dir in SEARCH_DIRS {
-            // VBoxXPCOMC locates the rest of VirtualBox through VBOX_APP_HOME, as the C glue sets it.
-            std::env::set_var("VBOX_APP_HOME", dir);
-            match Glue::load_from(Path::new(dir)) {
-                Ok(glue) => return Ok(glue),
-                Err(Error::LibraryNotFound(e) | Error::LibraryIncompatible(e)) => errors.push(e),
-                Err(e) => return Err(e),
-            }
-        }
-        std::env::remove_var("VBOX_APP_HOME");
-        Err(Error::LibraryNotFound(errors.join("; ")))
-    }
+// Safety: the function table is immutable, and VirtualBox's XPCOM proxies may be called from
+// any thread that initialized COM, which `client()` ensures before handing out the reference.
+unsafe impl Send for Client {}
+unsafe impl Sync for Client {}
 
-    fn load_from(dir: &Path) -> Result<Glue, Error> {
-        let path = dir.join(LIB_NAME);
-        let lib =
-            unsafe { Library::new(&path) }.map_err(|e| Error::LibraryNotFound(e.to_string()))?;
-        let api = unsafe {
-            let get: libloading::Symbol<unsafe extern "C" fn(u32) -> *const CApi> = lib
-                .get(b"VBoxGetCAPIFunctions\0")
-                .map_err(|e| Error::LibraryIncompatible(e.to_string()))?;
-            get(CAPI_VERSION)
+static CLIENT: Mutex<Option<&'static Client>> = Mutex::new(None);
+
+thread_local! {
+    static THREAD_COM: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Returns the process-wide client, loading and initializing it on first use, and initializes
+/// COM on the calling thread if it is not the one that initialized the client.
+fn client() -> Result<&'static Client, Error> {
+    let mut slot = CLIENT.lock().unwrap_or_else(|e| e.into_inner());
+    let client = match *slot {
+        Some(client) => client,
+        None => {
+            let client: &'static Client = Box::leak(Box::new(Client::init()?));
+            *slot = Some(client);
+            THREAD_COM.with(|c| c.set(true));
+            client
+        }
+    };
+    drop(slot);
+    if client.thread != std::thread::current().id() && !THREAD_COM.with(Cell::get) {
+        // shortcut: never paired with pfnClientThreadUninitialize, threads exit with COM initialized.
+        let rc = unsafe { (client.api.client_thread_initialize)() };
+        client.check("ClientThreadInitialize", rc)?;
+        THREAD_COM.with(|c| c.set(true));
+    }
+    Ok(client)
+}
+
+fn failed(rc: HResult) -> bool {
+    rc & 0x8000_0000 != 0
+}
+
+fn version_compatible(v: u32) -> bool {
+    // Same check as VBoxCAPIGlue.c: same major, minor at least ours.
+    v >> 16 == CAPI_VERSION >> 16 && v & 0xffff >= CAPI_VERSION & 0xffff
+}
+
+fn version_string(v: Option<u32>) -> String {
+    v.map_or("unknown".to_string(), |v| {
+        format!("{}.{}", v >> 16, v & 0xffff)
+    })
+}
+
+/// Takes ownership of an interface pointer returned by a successful call; null is an error.
+fn owned(call: &'static str, obj: *mut Obj) -> Result<Com, Error> {
+    if obj.is_null() {
+        return Err(Error::Api {
+            call,
+            rc: E_UNEXPECTED,
+            text: Some("returned a null object".to_string()),
+        });
+    }
+    Ok(Com(obj))
+}
+
+impl Client {
+    fn init() -> Result<Client, Error> {
+        let api = load_api()?;
+        let mut client = ptr::null_mut();
+        let rc = unsafe { (api.client_initialize)(ptr::null(), &mut client) };
+        // A failed ClientInitialize has already uninitialized: no error info to fetch.
+        if failed(rc) {
+            return Err(Error::Api {
+                call: "ClientInitialize",
+                rc,
+                text: None,
+            });
+        }
+        let client = owned("ClientInitialize", client)?;
+        let mut this = Client {
+            api,
+            vbox: Com(ptr::null_mut()),
+            vbox_client: client,
+            thread: std::thread::current().id(),
         };
-        // Same check as VBoxCAPIGlue.c: same major, minor at least ours.
-        let version = unsafe { api.as_ref() }.map(|api| api.version);
-        match version {
-            Some(v) if v >> 16 == CAPI_VERSION >> 16 && v & 0xffff >= CAPI_VERSION & 0xffff => {}
-            _ => {
-                return Err(Error::LibraryIncompatible(format!(
-                    "{}: C API version {:#x?}, need {:#x}",
-                    path.display(),
-                    version,
-                    CAPI_VERSION
-                )))
-            }
-        }
-        Ok(Glue { api, _lib: lib })
-    }
-
-    fn api(&self) -> &CApi {
-        unsafe { &*self.api }
+        this.vbox = this.get(&this.vbox_client, 3, "IVirtualBoxClient::GetVirtualBox")?;
+        Ok(this)
     }
 
     fn check(&self, call: &'static str, rc: HResult) -> Result<(), Error> {
-        if rc & 0x8000_0000 == 0 {
+        if !failed(rc) {
             return Ok(());
         }
         Err(Error::Api {
@@ -171,27 +220,27 @@ impl Glue {
     fn take_error_text(&self) -> Option<String> {
         unsafe {
             let mut ex = ptr::null_mut();
-            if (self.api().get_exception)(&mut ex) & 0x8000_0000 != 0 || ex.is_null() {
+            if failed((self.api.get_exception)(&mut ex)) || ex.is_null() {
                 return None;
             }
             let ex = Com(ex);
-            (self.api().clear_exception)();
+            (self.api.clear_exception)();
             let qi: unsafe extern "C" fn(*mut Obj, *const NsId, *mut *mut Obj) -> HResult =
                 ex.method(0);
             let mut info = ptr::null_mut();
-            if qi(ex.0, &IID_IVIRTUALBOXERRORINFO, &mut info) & 0x8000_0000 != 0 || info.is_null() {
+            if failed(qi(ex.0, &IID_IVIRTUALBOXERRORINFO, &mut info)) || info.is_null() {
                 return None;
             }
             let info = Com(info);
             let get_text: unsafe extern "C" fn(*mut Obj, *mut *mut u16) -> HResult =
                 info.method(17); // IVirtualBoxErrorInfo::GetText
             let mut text = ptr::null_mut();
-            if get_text(info.0, &mut text) & 0x8000_0000 != 0 || text.is_null() {
+            if failed(get_text(info.0, &mut text)) || text.is_null() {
                 return None;
             }
             let len = (0..).take_while(|&i| *text.add(i) != 0).count();
             let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
-            (self.api().com_unalloc_string)(text.cast());
+            (self.api.com_unalloc_string)(text.cast());
             Some(s)
         }
     }
@@ -203,59 +252,95 @@ impl Glue {
             let getter: unsafe extern "C" fn(*mut Obj, *mut *mut Obj) -> HResult = obj.method(idx);
             self.check(call, getter(obj.0, &mut out))?;
         }
-        Ok(Com(out))
+        owned(call, out)
     }
 }
 
-impl Drop for Glue {
-    fn drop(&mut self) {
-        unsafe { (self.api().client_uninitialize)() }
+/// Loads the library from `VBOX_APP_HOME`, else from the first standard directory that has it.
+/// A library found but incompatible stops the search.
+/// The library is never unloaded.
+fn load_api() -> Result<&'static CApi, Error> {
+    if let Some(home) = std::env::var_os("VBOX_APP_HOME") {
+        return load_api_from(Path::new(&home));
+    }
+    // Unlike VBoxCAPIGlue.c, VBOX_APP_HOME is not set here: XPCOM then falls back to the
+    // install's compiled-in RTPathAppPrivateArch(), which is that same directory.
+    for dir in SEARCH_DIRS {
+        match load_api_from(Path::new(dir)) {
+            Err(Error::LibraryNotFound(_)) => continue,
+            result => return result,
+        }
+    }
+    Err(Error::LibraryNotFound(format!(
+        "no {} in {}",
+        LIB_NAME,
+        SEARCH_DIRS.join(" or ")
+    )))
+}
+
+fn load_api_from(dir: &Path) -> Result<&'static CApi, Error> {
+    let path = dir.join(LIB_NAME);
+    let lib = unsafe { Library::new(&path) }.map_err(|e| Error::LibraryNotFound(e.to_string()))?;
+    let api = unsafe {
+        let get: libloading::Symbol<unsafe extern "C" fn(u32) -> *const CApi> = lib
+            .get(b"VBoxGetCAPIFunctions\0")
+            .map_err(|e| Error::LibraryIncompatible(e.to_string()))?;
+        get(CAPI_VERSION).as_ref()
+    };
+    match api {
+        Some(api) if version_compatible(api.version) => {
+            std::mem::forget(lib); // keeps `api` valid for the process lifetime
+            Ok(api)
+        }
+        _ => Err(Error::LibraryIncompatible(format!(
+            "{}: C API version {}, need {}",
+            path.display(),
+            version_string(api.map(|api| api.version)),
+            version_string(Some(CAPI_VERSION))
+        ))),
     }
 }
 
 /// A shared session on a running VM, unlocked on drop.
 ///
-/// Not `Send`/`Sync`: XPCOM was initialized on the creating thread, use it from there.
+/// Not `Send`/`Sync`: use it on the thread that attached. Any number of `Vm`s may be alive at
+/// once, on any threads.
 pub struct Vm {
-    // Field order is drop order: interfaces first, the client and library last.
+    // Field order is drop order.
     debugger: Com,
     console: Com,
     session: Com,
-    _vbox: Com,
-    _client: Com,
-    glue: Glue,
+    client: &'static Client,
 }
 
 impl Vm {
-    /// Loads the VirtualBox C API (`VBOX_APP_HOME`, else the standard install directories),
-    /// then locks a shared session on the running VM `name`.
+    /// Locks a shared session on the running VM `name`.
+    ///
+    /// The first call in the process loads the VirtualBox C API from `VBOX_APP_HOME`, else from
+    /// `/opt/VirtualBox` or `/usr/lib/virtualbox` (only for an installed VirtualBox, whose
+    /// compiled-in path XPCOM uses), and keeps it loaded until the process exits.
     pub fn attach(name: &str) -> Result<Vm, Error> {
-        let glue = Glue::load()?;
-        let mut client = ptr::null_mut();
-        let rc = unsafe { (glue.api().client_initialize)(ptr::null(), &mut client) };
-        let client = Com(client);
-        glue.check("ClientInitialize", rc)?;
-        let vbox = glue.get(&client, 3, "IVirtualBoxClient::GetVirtualBox")?;
-        let session = glue.get(&client, 4, "IVirtualBoxClient::GetSession")?;
+        let client = client()?;
+        let session = client.get(&client.vbox_client, 4, "IVirtualBoxClient::GetSession")?;
 
         let name_utf16: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let mut machine = ptr::null_mut();
         let rc = unsafe {
             let find: unsafe extern "C" fn(*mut Obj, *const u16, *mut *mut Obj) -> HResult =
-                vbox.method(49);
-            find(vbox.0, name_utf16.as_ptr(), &mut machine)
+                client.vbox.method(49);
+            find(client.vbox.0, name_utf16.as_ptr(), &mut machine)
         };
-        let machine = Com(machine);
         if rc == VBOX_E_OBJECT_NOT_FOUND {
-            glue.take_error_text();
+            client.take_error_text();
             return Err(Error::VmNotFound(name.to_string()));
         }
-        glue.check("IVirtualBox::FindMachine", rc)?;
+        client.check("IVirtualBox::FindMachine", rc)?;
+        let machine = owned("IVirtualBox::FindMachine", machine)?;
 
         let mut state = 0;
         unsafe {
             let get_state: unsafe extern "C" fn(*mut Obj, *mut u32) -> HResult = machine.method(61);
-            glue.check("IMachine::GetState", get_state(machine.0, &mut state))?;
+            client.check("IMachine::GetState", get_state(machine.0, &mut state))?;
         }
         if !MACHINE_STATES_ONLINE.contains(&state) {
             return Err(Error::VmNotRunning {
@@ -266,43 +351,50 @@ impl Vm {
         unsafe {
             let lock: unsafe extern "C" fn(*mut Obj, *mut Obj, u32) -> HResult =
                 machine.method(131);
-            glue.check(
+            client.check(
                 "IMachine::LockMachine",
                 lock(machine.0, session.0, LOCK_TYPE_SHARED),
             )?;
         }
+        drop(machine);
 
         // From here on, dropping `vm` unlocks the session.
         let mut vm = Vm {
             debugger: Com(ptr::null_mut()),
             console: Com(ptr::null_mut()),
             session,
-            _vbox: vbox,
-            _client: client,
-            glue,
+            client,
         };
-        vm.console = vm.glue.get(&vm.session, 8, "ISession::GetConsole")?;
-        vm.debugger = vm.glue.get(&vm.console, 9, "IConsole::GetDebugger")?;
+        vm.console = client.get(&vm.session, 8, "ISession::GetConsole")?;
+        vm.debugger = client.get(&vm.console, 9, "IConsole::GetDebugger")?;
         Ok(vm)
     }
 
     /// Fills `buf` with guest physical memory starting at `paddr` (`IMachineDebugger::readPhysicalMemory`).
     pub fn read_physical(&self, paddr: u64, buf: &mut [u8]) -> Result<(), Error> {
+        let out_of_range = || Error::AddressOutOfRange {
+            paddr,
+            len: buf.len(),
+        };
+        let end = i64::try_from(paddr)
+            .ok()
+            .and_then(|start| start.checked_add(i64::try_from(buf.len()).ok()?))
+            .ok_or_else(out_of_range)?;
         let read: unsafe extern "C" fn(*mut Obj, i64, u32, *mut u32, *mut *mut u8) -> HResult =
             unsafe { self.debugger.method(48) };
-        let mut addr = paddr;
-        for chunk in buf.chunks_mut(u32::MAX as usize) {
+        let mut addr = end - buf.len() as i64;
+        for chunk in buf.chunks_mut(READ_CHUNK) {
             let (mut len, mut data) = (0u32, ptr::null_mut());
             let rc = unsafe {
                 read(
                     self.debugger.0,
-                    addr as i64,
+                    addr,
                     chunk.len() as u32,
                     &mut len,
                     &mut data,
                 )
             };
-            self.glue
+            self.client
                 .check("IMachineDebugger::ReadPhysicalMemory", rc)?;
             let result = if len as usize == chunk.len() && !data.is_null() {
                 chunk.copy_from_slice(unsafe { std::slice::from_raw_parts(data, chunk.len()) });
@@ -314,9 +406,9 @@ impl Vm {
                     text: Some(format!("returned {} bytes, expected {}", len, chunk.len())),
                 })
             };
-            unsafe { (self.glue.api().com_unalloc_string)(data.cast()) };
+            unsafe { (self.client.api.com_unalloc_string)(data.cast()) };
             result?;
-            addr += chunk.len() as u64;
+            addr += chunk.len() as i64;
         }
         Ok(())
     }
@@ -328,5 +420,21 @@ impl Drop for Vm {
             let unlock: unsafe extern "C" fn(*mut Obj) -> HResult = self.session.method(17);
             unlock(self.session.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_check() {
+        assert!(version_compatible(0x0004_0001));
+        assert!(version_compatible(0x0004_0002));
+        assert!(!version_compatible(0x0004_0000));
+        assert!(!version_compatible(0x0005_0001));
+        assert!(!version_compatible(0x0003_0001));
+        assert_eq!(version_string(Some(0x0005_0000)), "5.0");
+        assert_eq!(version_string(None), "unknown");
     }
 }
