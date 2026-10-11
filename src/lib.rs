@@ -29,6 +29,7 @@ const SEARCH_DIRS: &[&str] = &["/opt/VirtualBox", "/usr/lib/virtualbox"];
 const CAPI_VERSION: u32 = 0x0004_0001;
 const VBOX_E_OBJECT_NOT_FOUND: HResult = 0x80BB_0001;
 const E_UNEXPECTED: HResult = 0x8000_FFFF;
+const E_NOTIMPL: HResult = 0x8000_4001;
 /// Bytes per `readPhysicalMemory` call.
 const READ_CHUNK: usize = 1 << 20;
 const LOCK_TYPE_SHARED: u32 = 1;
@@ -56,6 +57,8 @@ pub enum Error {
     VmBusy(u32),
     #[error("VM is in MachineState {state}, expected {expected}")]
     UnexpectedState { state: u32, expected: u32 },
+    #[error("this VirtualBox does not implement IMachineDebugger::readPhysicalMemory: it lacks the IMachineDebugger memory access patch (build Wenzel/virtualbox branch vmi/machinedebugger, or use a VirtualBox release that includes it)")]
+    MemoryAccessNotImplemented,
     #[error("guest physical range {paddr:#x} + {len:#x} is out of range")]
     AddressOutOfRange { paddr: u64, len: usize },
     #[error("VirtualBox API call {call} failed with {rc:#010x}{}", text.as_ref().map(|t| format!(": {}", t)).unwrap_or_default())]
@@ -479,6 +482,7 @@ impl Vm {
     }
 
     /// Fills `buf` with guest physical memory starting at `paddr` (`IMachineDebugger::readPhysicalMemory`).
+    /// Fails with [`Error::MemoryAccessNotImplemented`] on a VirtualBox without the memory access patch.
     pub fn read_physical(&self, paddr: u64, buf: &mut [u8]) -> Result<(), Error> {
         let out_of_range = || Error::AddressOutOfRange {
             paddr,
@@ -502,6 +506,10 @@ impl Vm {
                     &mut data,
                 )
             };
+            if rc == E_NOTIMPL {
+                self.client.take_error_text();
+                return Err(Error::MemoryAccessNotImplemented);
+            }
             self.client
                 .check("IMachineDebugger::ReadPhysicalMemory", rc)?;
             let result = if len as usize == chunk.len() && !data.is_null() {
