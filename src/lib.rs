@@ -1,9 +1,9 @@
 //! Minimal binding to VirtualBox's C API, loaded at runtime (dlopen) from an installed VirtualBox.
 //!
-//! It covers only what libmicrovmi's MachineDebugger access method needs: attach a shared
-//! session to a running VM by name, read and write guest physical memory and CPU registers
-//! through `IMachineDebugger`, list the guest's RAM ranges, pause and resume it, and get its
-//! vCPU count.
+//! It covers only what libmicrovmi's VirtualBox driver needs: attach a shared session to a
+//! running VM by name, read and write guest physical memory and CPU registers through
+//! `IMachineDebugger`, list the guest's RAM ranges, pause and resume it, get its vCPU count, and
+//! locate its VBoxVMI socket.
 //!
 //! The function table and vtable indices are hand-written from `VBoxCAPI_v7_3.h`
 //! (`sdk/bindings/c/include` of a VirtualBox build); `VBoxCAPIGlue.c` is the loader reference.
@@ -13,7 +13,7 @@ use std::convert::TryFrom;
 use std::ffi::c_void;
 use std::ops::Range;
 use std::os::raw::c_char;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Mutex;
 use std::thread::ThreadId;
@@ -349,6 +349,62 @@ impl Client {
         }
         Ok(out)
     }
+
+    /// Calls a string getter at vtable index `idx` of `obj`; null is an empty string.
+    fn get_string(&self, obj: &Com, idx: usize, call: &'static str) -> Result<String, Error> {
+        let mut out = ptr::null_mut();
+        unsafe {
+            let getter: unsafe extern "C" fn(*mut Obj, *mut *mut u16) -> HResult = obj.method(idx);
+            self.check(call, getter(obj.0, &mut out))?;
+            Ok(self.take_string(out).unwrap_or_default())
+        }
+    }
+
+    /// `IVirtualBox::FindMachine`, with [`Error::VmNotFound`] for an unknown `name`.
+    fn find_machine(&self, name: &str) -> Result<Com, Error> {
+        let name_utf16: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let mut machine = ptr::null_mut();
+        let rc = unsafe {
+            let find: unsafe extern "C" fn(*mut Obj, *const u16, *mut *mut Obj) -> HResult =
+                self.vbox.method(49);
+            find(self.vbox.0, name_utf16.as_ptr(), &mut machine)
+        };
+        if rc == VBOX_E_OBJECT_NOT_FOUND {
+            self.take_error_text();
+            return Err(Error::VmNotFound(name.to_string()));
+        }
+        self.check("IVirtualBox::FindMachine", rc)?;
+        owned("IVirtualBox::FindMachine", machine)
+    }
+}
+
+/// The VBoxVMI socket path a patched VirtualBox serves for the VM `name` (a name or UUID): its
+/// `VBoxInternal/VMI/SocketPath` extradata if set, else `<VirtualBox home>/vmi/<VM UUID>.sock`,
+/// as the VM process configures it. The VM need not be running, nor VBoxVMI enabled.
+pub fn vmi_socket_path(name: &str) -> Result<PathBuf, Error> {
+    let client = client()?;
+    let machine = client.find_machine(name)?;
+    let key: Vec<u16> = "VBoxInternal/VMI/SocketPath"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut value = ptr::null_mut();
+    let value = unsafe {
+        let get: unsafe extern "C" fn(*mut Obj, *const u16, *mut *mut u16) -> HResult =
+            machine.method(165);
+        client.check(
+            "IMachine::GetExtraData",
+            get(machine.0, key.as_ptr(), &mut value),
+        )?;
+        client.take_string(value).unwrap_or_default()
+    };
+    // VirtualBox stores an unset extradata key as an empty value.
+    if !value.is_empty() {
+        return Ok(PathBuf::from(value));
+    }
+    let home = client.get_string(&client.vbox, 9, "IVirtualBox::GetHomeFolder")?;
+    let id = client.get_string(&machine, 12, "IMachine::GetId")?;
+    Ok(Path::new(&home).join("vmi").join(format!("{}.sock", id)))
 }
 
 /// Loads the library from `VBOX_APP_HOME`, else from the first standard directory that has it.
@@ -421,19 +477,7 @@ impl Vm {
         let client = client()?;
         let session = client.get(&client.vbox_client, 4, "IVirtualBoxClient::GetSession")?;
 
-        let name_utf16: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-        let mut machine = ptr::null_mut();
-        let rc = unsafe {
-            let find: unsafe extern "C" fn(*mut Obj, *const u16, *mut *mut Obj) -> HResult =
-                client.vbox.method(49);
-            find(client.vbox.0, name_utf16.as_ptr(), &mut machine)
-        };
-        if rc == VBOX_E_OBJECT_NOT_FOUND {
-            client.take_error_text();
-            return Err(Error::VmNotFound(name.to_string()));
-        }
-        client.check("IVirtualBox::FindMachine", rc)?;
-        let machine = owned("IVirtualBox::FindMachine", machine)?;
+        let machine = client.find_machine(name)?;
 
         let state = client.get_u32(&machine, 61, "IMachine::GetState")?;
         if !MACHINE_STATES_ONLINE.contains(&state) {
