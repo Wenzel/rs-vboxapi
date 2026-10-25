@@ -852,10 +852,17 @@ impl Vm {
 /// Parses the page-type lines of `pgmR3PhysInfo` (`info phys verbose`): per RAM range, an
 /// indented `{first:016x}-{last:016x} {type}[ {desc}]` line per run of same-type pages, with
 /// type `RAM`, `MMIO`, `MMIO2`, `ROM`, `ROM-shadowed`, ... Keeps `RAM` runs only, merged.
+/// Runs under the VBoxVMI Hidden page pool's range header (`PGMR3PhysRegisterVmiHidden`)
+/// are skipped: the pool sits right above RAM but isn't guest RAM.
 /// Every indented line must parse, so a format change can't silently lower the max address.
 fn parse_ram_ranges(text: &str) -> Result<Vec<Range<u64>>, String> {
     let mut ranges = Vec::new();
-    for line in text.lines().filter(|l| l.starts_with(' ')) {
+    let mut hidden = false;
+    for line in text.lines() {
+        if !line.starts_with(' ') {
+            hidden = line.ends_with(" VBoxVMI Hidden RAM");
+            continue;
+        }
         let parsed = || -> Option<(u64, u64, bool)> {
             let mut words = line.split_whitespace();
             let (first, last) = words.next()?.split_once('-')?;
@@ -868,7 +875,7 @@ fn parse_ram_ranges(text: &str) -> Result<Vec<Range<u64>>, String> {
         };
         let (first, last, is_ram) =
             parsed().ok_or_else(|| format!("unexpected line {:?}", line))?;
-        if is_ram {
+        if is_ram && !hidden {
             // An end-exclusive Range can't hold a range ending at u64::MAX.
             let end = last.checked_add(1).ok_or_else(|| {
                 format!("RAM range ends at the top of the address space: {:?}", line)
@@ -952,6 +959,15 @@ mod tests {
             parse_ram_ranges("    0-fff RAM\n    ffffffff00000000-ffffffffffffffff MMIO\n")
                 .unwrap(),
             vec![0..0x1000]
+        );
+        // The Hidden pool's runs are left out, even contiguous with RAM.
+        assert_eq!(
+            parse_ram_ranges(
+                "0000000000000000-000000001fffffff 0 base RAM\n    0-1fffffff RAM\n\
+                 0000000020000000-000000002000ffff 0 VBoxVMI Hidden RAM\n    20000000-2000ffff RAM\n"
+            )
+            .unwrap(),
+            vec![0..0x2000_0000]
         );
     }
 }
